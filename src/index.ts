@@ -7,6 +7,9 @@ import { createMcpServer } from './server';
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  console.error(
+    `[polymarket] signatureType=${config.signatureType} funder=${config.funderAddress ?? 'none'}`
+  );
   const client = new PolymarketClient(config);
 
   if (!isReadOnly(config)) {

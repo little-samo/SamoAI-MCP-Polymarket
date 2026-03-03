@@ -81,7 +81,6 @@ cp .env.example .env
 |----------|----------|-------------|
 | `PORT` | No | Server port (default: 11188) |
 | `POLYMARKET_PRIVATE_KEY` | No | Ethereum private key for trading |
-| `POLYMARKET_FUNDER_ADDRESS` | No | Proxy wallet address (see [Authentication](#authentication)) |
 | `POLYMARKET_SIGNATURE_TYPE` | No | Signature type: `0` (EOA), `1` (POLY_PROXY), `2` (GNOSIS_SAFE, default) |
 
 If `POLYMARKET_PRIVATE_KEY` is not set, the server runs in **read-only mode** — market data tools work, trading tools return an error.
@@ -98,7 +97,7 @@ Only `POLYMARKET_PRIVATE_KEY` is required for trading. API credentials are **aut
 | POLY_PROXY | `1` | Magic Link login users who exported their PK from Polymarket.com |
 | GNOSIS_SAFE | `2` | Most common — use this for new or returning users (default) |
 
-When using `GNOSIS_SAFE` (default), set `POLYMARKET_FUNDER_ADDRESS` to the proxy wallet address shown on your [Polymarket profile](https://polymarket.com/settings).
+The funder (maker) address defaults to the signer address derived from your private key.
 
 ## Usage
 

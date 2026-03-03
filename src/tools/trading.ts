@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { Side } from '../polymarket/client';
+import { getMarketByConditionId } from '../polymarket/gamma';
 
 import { formatResult, formatError, requireAuth } from './utils';
 
@@ -12,90 +13,57 @@ export function registerTradingTools(
   client: PolymarketClient
 ): void {
   server.registerTool(
-    'create_order',
+    'place_order',
     {
       description:
-        'Place a limit order (GTC). Specify the token_id, side (BUY/SELL), price, and size. Tick size and neg_risk are auto-detected. Price must be between 0 and 1. Size is the number of shares.',
+        'Place a limit (GTC) or market (FOK) order. For limit: set price (0-1) and size (shares). For market buy: set amount in USDC. For market sell: set amount in shares.',
       inputSchema: z.object({
         token_id: z
           .string()
           .min(1)
           .describe('Token ID of the outcome to trade'),
         side: z.enum(['BUY', 'SELL']).describe('Order side'),
+        type: z
+          .enum(['limit', 'market'])
+          .default('limit')
+          .describe('Order type'),
         price: z
           .number()
           .gt(0)
           .lt(1)
-          .describe('Limit price (between 0 and 1 exclusive)'),
-        size: z.number().gt(0).describe('Number of shares'),
-      }),
-    },
-    async ({ token_id, side, price, size }) => {
-      const authErr = requireAuth(client.isReadOnly);
-      if (authErr) return formatError(authErr);
-      try {
-        const orderSide = side === 'BUY' ? Side.BUY : Side.SELL;
-        const result = await client.createLimitOrder(
-          token_id,
-          orderSide,
-          price,
-          size
-        );
-        return formatResult(result);
-      } catch (e) {
-        return formatError(e);
-      }
-    }
-  );
-
-  server.registerTool(
-    'create_market_order',
-    {
-      description:
-        'Place a market order (FOK). For BUY: amount is in USDC. For SELL: amount is in shares.',
-      inputSchema: z.object({
-        token_id: z
-          .string()
-          .min(1)
-          .describe('Token ID of the outcome to trade'),
-        side: z.enum(['BUY', 'SELL']).describe('Order side'),
+          .optional()
+          .describe('Limit price (required for limit orders)'),
+        size: z
+          .number()
+          .gt(0)
+          .optional()
+          .describe('Share count (required for limit orders)'),
         amount: z
           .number()
           .gt(0)
-          .describe('For BUY: USDC amount. For SELL: number of shares'),
+          .optional()
+          .describe('USDC for market buy, shares for market sell'),
       }),
     },
-    async ({ token_id, side, amount }) => {
+    async ({ token_id, side, type, price, size, amount }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       try {
         const orderSide = side === 'BUY' ? Side.BUY : Side.SELL;
-        const result = await client.createMarketOrder(
-          token_id,
-          orderSide,
-          amount
+        if (type === 'limit') {
+          if (price === undefined || size === undefined) {
+            return formatError('Limit orders require both price and size');
+          }
+          return formatResult(
+            await client.createLimitOrder(token_id, orderSide, price, size)
+          );
+        }
+        if (amount === undefined) {
+          return formatError('Market orders require amount');
+        }
+        return formatResult(
+          await client.createMarketOrder(token_id, orderSide, amount)
         );
-        return formatResult(result);
-      } catch (e) {
-        return formatError(e);
-      }
-    }
-  );
-
-  server.registerTool(
-    'cancel_order',
-    {
-      description: 'Cancel a specific open order by order ID.',
-      inputSchema: z.object({
-        order_id: z.string().min(1).describe('Order ID to cancel'),
-      }),
-    },
-    async ({ order_id }) => {
-      const authErr = requireAuth(client.isReadOnly);
-      if (authErr) return formatError(authErr);
-      try {
-        const result = await client.cancelOrder(order_id);
-        return formatResult(result);
       } catch (e) {
         return formatError(e);
       }
@@ -105,70 +73,86 @@ export function registerTradingTools(
   server.registerTool(
     'cancel_orders',
     {
-      description: 'Cancel multiple open orders by their order IDs.',
+      description:
+        'Cancel orders. Provide order_ids for specific orders, market/asset_id to cancel by market, or all=true to cancel everything.',
       inputSchema: z.object({
         order_ids: z
-          .array(z.string().min(1))
-          .min(1)
-          .max(3000)
-          .describe('Array of order IDs to cancel'),
-      }),
-    },
-    async ({ order_ids }) => {
-      const authErr = requireAuth(client.isReadOnly);
-      if (authErr) return formatError(authErr);
-      try {
-        const result = await client.cancelOrders(order_ids);
-        return formatResult(result);
-      } catch (e) {
-        return formatError(e);
-      }
-    }
-  );
-
-  server.registerTool(
-    'cancel_all_orders',
-    {
-      description:
-        'Cancel ALL open orders for the authenticated user. Use with caution.',
-      inputSchema: z.object({}),
-    },
-    async () => {
-      const authErr = requireAuth(client.isReadOnly);
-      if (authErr) return formatError(authErr);
-      try {
-        const result = await client.cancelAll();
-        return formatResult(result);
-      } catch (e) {
-        return formatError(e);
-      }
-    }
-  );
-
-  server.registerTool(
-    'cancel_market_orders',
-    {
-      description: 'Cancel all open orders for a specific market or token.',
-      inputSchema: z.object({
+          .array(z.string())
+          .optional()
+          .describe('Specific order IDs to cancel'),
         market: z
           .string()
           .optional()
-          .describe('Market condition ID to cancel orders for'),
+          .describe('Cancel all orders in this market (condition ID)'),
         asset_id: z
           .string()
           .optional()
-          .describe('Token ID to cancel orders for'),
+          .describe('Cancel all orders for this token'),
+        all: z.boolean().default(false).describe('Cancel ALL open orders'),
       }),
     },
-    async ({ market, asset_id }) => {
+    async ({ order_ids, market, asset_id, all }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       try {
-        const result = await client.cancelMarketOrders({
-          market,
-          asset_id,
+        if (all) {
+          return formatResult(await client.cancelAll());
+        }
+        if (order_ids?.length) {
+          if (order_ids.length === 1) {
+            return formatResult(await client.cancelOrder(order_ids[0]));
+          }
+          return formatResult(await client.cancelOrders(order_ids));
+        }
+        if (market || asset_id) {
+          return formatResult(
+            await client.cancelMarketOrders({ market, asset_id })
+          );
+        }
+        return formatError(
+          'Provide order_ids, market, asset_id, or set all=true'
+        );
+      } catch (e) {
+        return formatError(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    'redeem_positions',
+    {
+      description:
+        'Redeem (claim) winning positions after market resolution. Executes an on-chain transaction through the Gnosis Safe proxy. Requires POL for gas. Use get_account with positions section to find redeemable positions.',
+      inputSchema: z.object({
+        condition_id: z
+          .string()
+          .min(1)
+          .describe('Market condition ID to redeem'),
+      }),
+    },
+    async ({ condition_id }) => {
+      const authErr = requireAuth(client.isReadOnly);
+      if (authErr) return formatError(authErr);
+      try {
+        const market = await getMarketByConditionId(condition_id);
+        if (!market) return formatError('Market not found');
+
+        let tokenIds: string[] = [];
+        try {
+          tokenIds = JSON.parse(market.clobTokenIds);
+        } catch {
+          return formatError('Could not parse token IDs from market data');
+        }
+
+        const result = await client.redeemPositions(
+          condition_id,
+          tokenIds,
+          market.negRisk
+        );
+        return formatResult({
+          success: true,
+          ...result,
         });
-        return formatResult(result);
       } catch (e) {
         return formatError(e);
       }

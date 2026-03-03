@@ -6,7 +6,7 @@ import {
   AssetType,
   PriceHistoryInterval,
 } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { Wallet, Contract, constants, utils, providers } from 'ethers';
 
 import { isReadOnly } from '../config';
 
@@ -28,6 +28,21 @@ import type {
 
 const CLOB_HOST = 'https://clob.polymarket.com';
 const POLYGON_CHAIN_ID = Chain.POLYGON;
+
+const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
+const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+
+const CTF_ABI = [
+  'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets)',
+  'function balanceOf(address owner, uint256 id) view returns (uint256)',
+];
+const NEG_RISK_REDEEM_ABI = [
+  'function redeemPositions(bytes32 conditionId, uint256[] calldata amounts)',
+];
+const SAFE_EXEC_ABI = [
+  'function execTransaction(address to, uint256 value, bytes calldata data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes memory signatures) external payable returns (bool)',
+];
 
 export { Side, OrderType, AssetType, PriceHistoryInterval };
 export type {
@@ -68,8 +83,8 @@ export class PolymarketClient {
     return this.wallet?.address ?? null;
   }
 
-  public get funderAddress(): string | undefined {
-    return this.config.funderAddress;
+  public get proxyAddress(): string | null {
+    return this.config.funderAddress ?? this.wallet?.address ?? null;
   }
 
   public async initTrading(): Promise<void> {
@@ -108,25 +123,28 @@ export class PolymarketClient {
     return this.readonlyClob.getOrderBook(tokenId);
   }
 
+  private extractValue(res: unknown): string {
+    if (res === null || res === undefined) return '0';
+    if (typeof res !== 'object') return String(res);
+    const obj = res as Record<string, unknown>;
+    for (const v of Object.values(obj)) {
+      if (v !== null && v !== undefined && typeof v !== 'object') {
+        return String(v);
+      }
+    }
+    return JSON.stringify(res);
+  }
+
   public async getMidpoint(tokenId: string): Promise<string> {
-    const res = await this.readonlyClob.getMidpoint(tokenId);
-    return typeof res === 'object' && res.mid !== undefined
-      ? String(res.mid)
-      : String(res);
+    return this.extractValue(await this.readonlyClob.getMidpoint(tokenId));
   }
 
   public async getPrice(tokenId: string, side: Side): Promise<string> {
-    const res = await this.readonlyClob.getPrice(tokenId, side);
-    return typeof res === 'object' && res.price !== undefined
-      ? String(res.price)
-      : String(res);
+    return this.extractValue(await this.readonlyClob.getPrice(tokenId, side));
   }
 
   public async getSpread(tokenId: string): Promise<string> {
-    const res = await this.readonlyClob.getSpread(tokenId);
-    return typeof res === 'object' && res.spread !== undefined
-      ? String(res.spread)
-      : String(res);
+    return this.extractValue(await this.readonlyClob.getSpread(tokenId));
   }
 
   public async getLastTradePrice(
@@ -161,6 +179,19 @@ export class PolymarketClient {
   ): Promise<BalanceAllowanceResponse> {
     const clob = this.requireTrading();
     return clob.getBalanceAllowance({
+      asset_type: assetType,
+      token_id: tokenId,
+    });
+  }
+
+  public async updateBalanceAllowance(
+    assetType: AssetType = AssetType.COLLATERAL,
+    tokenId?: string
+  ): Promise<unknown> {
+    const clob = this.requireTrading();
+    return (
+      clob as unknown as Record<string, CallableFunction>
+    ).updateBalanceAllowance({
       asset_type: assetType,
       token_id: tokenId,
     });
@@ -227,5 +258,80 @@ export class PolymarketClient {
   ): Promise<unknown> {
     const clob = this.requireTrading();
     return clob.cancelMarketOrders(params);
+  }
+
+  // ─── On-chain (redeem) ──────────────────────────────────────
+
+  public async redeemPositions(
+    conditionId: string,
+    tokenIds: string[],
+    negRisk: boolean
+  ): Promise<{ transactionHash: string }> {
+    if (!this.wallet) {
+      throw new Error('No private key configured');
+    }
+    const safeAddress = this.config.funderAddress;
+    if (!safeAddress) {
+      throw new Error(
+        'POLYMARKET_FUNDER_ADDRESS required for on-chain redemption'
+      );
+    }
+
+    const provider = new providers.JsonRpcProvider(this.config.rpcUrl);
+    const signer = this.wallet.connect(provider);
+
+    let targetContract: string;
+    let calldata: string;
+
+    if (negRisk) {
+      const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
+      const balances = await Promise.all(
+        tokenIds.map((tid) => ctf.balanceOf(safeAddress, tid))
+      );
+      const iface = new utils.Interface(NEG_RISK_REDEEM_ABI);
+      targetContract = NEG_RISK_ADAPTER;
+      calldata = iface.encodeFunctionData('redeemPositions', [
+        conditionId,
+        balances,
+      ]);
+    } else {
+      const iface = new utils.Interface(CTF_ABI);
+      targetContract = CTF_ADDRESS;
+      calldata = iface.encodeFunctionData('redeemPositions', [
+        USDC_E,
+        constants.HashZero,
+        conditionId,
+        [1, 2],
+      ]);
+    }
+
+    const signature = utils.solidityPack(
+      ['bytes32', 'bytes32', 'uint8'],
+      [utils.hexZeroPad(signer.address, 32), constants.HashZero, 1]
+    );
+
+    const safe = new Contract(safeAddress, SAFE_EXEC_ABI, signer);
+    const minTip = utils.parseUnits('30', 'gwei');
+    const feeData = await provider.getFeeData();
+    const basePriority = feeData.maxPriorityFeePerGas ?? minTip;
+    const maxPriority = basePriority.lt(minTip) ? minTip : basePriority;
+    const maxFee = (feeData.maxFeePerGas ?? maxPriority).add(maxPriority);
+
+    const tx = await safe.execTransaction(
+      targetContract,
+      0,
+      calldata,
+      0,
+      0,
+      0,
+      0,
+      constants.AddressZero,
+      constants.AddressZero,
+      signature,
+      { maxPriorityFeePerGas: maxPriority, maxFeePerGas: maxFee }
+    );
+
+    const receipt = await tx.wait();
+    return { transactionHash: receipt.transactionHash };
   }
 }

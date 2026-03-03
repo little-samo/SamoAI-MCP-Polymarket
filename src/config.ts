@@ -3,8 +3,9 @@ import 'dotenv/config';
 export interface PolymarketConfig {
   port: number;
   privateKey: string | undefined;
-  funderAddress: string | undefined;
   signatureType: number;
+  funderAddress: string | undefined;
+  rpcUrl: string;
 }
 
 export function loadConfig(): PolymarketConfig {
@@ -17,8 +18,9 @@ export function loadConfig(): PolymarketConfig {
   return {
     port: parseInt(process.env.PORT || '11188', 10),
     privateKey: process.env.POLYMARKET_PRIVATE_KEY || undefined,
-    funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS || undefined,
     signatureType: sigType,
+    funderAddress: process.env.POLYMARKET_FUNDER_ADDRESS || undefined,
+    rpcUrl: process.env.POLYGON_RPC_URL || 'https://polygon.drpc.org',
   };
 }
 
