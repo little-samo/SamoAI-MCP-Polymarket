@@ -18,6 +18,7 @@
 - **Market Discovery** — Search markets, browse events, and get detailed market info via Polymarket's Gamma and CLOB APIs
 - **Real-time Market Data** — Order books, prices, spreads, and recent trades
 - **Trading** — Place limit and market orders, cancel orders, check balances and positions
+- **Gasless Claim** — Redeem resolved positions through Polymarket's Builder Relayer when builder credentials are configured
 - **Read-only Mode** — Runs without authentication for market data only; provide a private key to enable trading
 - **Streamable HTTP Transport** — Standard MCP server compatible with any MCP client
 
@@ -82,12 +83,20 @@ cp .env.example .env
 | `PORT` | No | Server port (default: 11188) |
 | `POLYMARKET_PRIVATE_KEY` | No | Ethereum private key for trading |
 | `POLYMARKET_SIGNATURE_TYPE` | No | Signature type: `0` (EOA), `1` (POLY_PROXY), `2` (GNOSIS_SAFE, default) |
+| `POLYMARKET_FUNDER_ADDRESS` | Sometimes | Required for `POLY_PROXY` and `GNOSIS_SAFE`; wallet/proxy address shown in Polymarket settings |
+| `POLYGON_RPC_URL` | No | Primary Polygon RPC URL. Fallback order is `POLYGON_RPC_URL` or `https://polygon.drpc.org`, then `https://rpc-mainnet.matic.quiknode.pro`, then `https://polygon-rpc.com` |
+| `POLY_BUILDER_API_KEY` | No | Enables gasless claim when used together with the builder secret and passphrase |
+| `POLY_BUILDER_SECRET` | No | Builder relayer secret for gasless claim |
+| `POLY_BUILDER_PASSPHRASE` | No | Builder relayer passphrase for gasless claim |
+| `POLYMARKET_RELAYER_URL` | No | Optional override for the Polymarket builder relayer URL |
 
 If `POLYMARKET_PRIVATE_KEY` is not set, the server runs in **read-only mode** — market data tools work, trading tools return an error.
 
 ### Authentication
 
 Only `POLYMARKET_PRIVATE_KEY` is required for trading. API credentials are **automatically derived** from your private key on startup via Polymarket's L1 authentication.
+
+If `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, and `POLY_BUILDER_PASSPHRASE` are all set, `redeem_positions` will try a gasless claim through Polymarket's Builder Relayer first. If the gasless flow fails, the server automatically falls back to the normal on-chain transaction path.
 
 **Signature types** (see [Polymarket docs](https://docs.polymarket.com/api-reference/authentication)):
 

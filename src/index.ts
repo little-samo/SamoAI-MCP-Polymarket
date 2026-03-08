@@ -10,6 +10,12 @@ async function main(): Promise<void> {
   console.error(
     `[polymarket] signatureType=${config.signatureType} funder=${config.funderAddress ?? 'none'}`
   );
+  console.error(
+    `[polymarket] polygonRpcFallbacks=${config.rpcUrls.join(' -> ')}`
+  );
+  if (config.builderRelayer) {
+    console.error('[polymarket] Gasless claim enabled via builder relayer');
+  }
   const client = new PolymarketClient(config);
 
   if (!isReadOnly(config)) {

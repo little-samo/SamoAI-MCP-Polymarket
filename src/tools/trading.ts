@@ -122,15 +122,21 @@ export function registerTradingTools(
     'redeem_positions',
     {
       description:
-        'Redeem (claim) winning positions after market resolution. Executes an on-chain transaction through the Gnosis Safe proxy. Requires POL for gas. Use get_account with positions section to find redeemable positions.',
+        'Redeem (claim) winning positions after market resolution. Uses Polymarket builder relayer for gasless claim when configured, otherwise falls back to an on-chain transaction. Use get_positions to find redeemable positions.',
       inputSchema: z.object({
         condition_id: z
           .string()
           .min(1)
           .describe('Market condition ID to redeem'),
+        method: z
+          .enum(['auto', 'gasless', 'onchain'])
+          .default('auto')
+          .describe(
+            'Claim method: gasless (builder relayer), onchain (direct tx), or auto (gasless with onchain fallback)'
+          ),
       }),
     },
-    async ({ condition_id }) => {
+    async ({ condition_id, method }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       try {
@@ -147,7 +153,8 @@ export function registerTradingTools(
         const result = await client.redeemPositions(
           condition_id,
           tokenIds,
-          market.negRisk
+          market.negRisk,
+          method
         );
         return formatResult({
           success: true,

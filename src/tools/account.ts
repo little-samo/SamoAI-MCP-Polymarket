@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { getPositions } from '../polymarket/gamma';
+
 import { formatResult, formatError, requireAuth } from './utils';
 
 import type { PolymarketClient } from '../polymarket/client';
@@ -23,9 +24,7 @@ export function registerAccountTools(
         market: z
           .string()
           .optional()
-          .describe(
-            'Filter positions/orders/trades by market condition ID'
-          ),
+          .describe('Filter positions/orders/trades by market condition ID'),
         order_id: z
           .string()
           .optional()
@@ -57,24 +56,26 @@ export function registerAccountTools(
 
         if (sections.includes('positions')) {
           tasks.push(
-            getPositions(proxyAddr, { market, limit: 100 }).then((positions) => {
-              result.positions = {
-                count: positions.length,
-                items: positions.map((p) => ({
-                  title: p.title,
-                  outcome: p.outcome,
-                  size: p.size,
-                  avgPrice: p.avgPrice,
-                  curPrice: p.curPrice,
-                  currentValue: p.currentValue,
-                  cashPnl: p.cashPnl,
-                  percentPnl: p.percentPnl,
-                  conditionId: p.conditionId,
-                  endDate: p.endDate,
-                  redeemable: p.redeemable,
-                })),
-              };
-            })
+            getPositions(proxyAddr, { market, limit: 100 }).then(
+              (positions) => {
+                result.positions = {
+                  count: positions.length,
+                  items: positions.map((p) => ({
+                    title: p.title,
+                    outcome: p.outcome,
+                    size: p.size,
+                    avgPrice: p.avgPrice,
+                    curPrice: p.curPrice,
+                    currentValue: p.currentValue,
+                    cashPnl: p.cashPnl,
+                    percentPnl: p.percentPnl,
+                    conditionId: p.conditionId,
+                    endDate: p.endDate,
+                    redeemable: p.redeemable,
+                  })),
+                };
+              }
+            )
           );
         }
 

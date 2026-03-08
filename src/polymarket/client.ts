@@ -1,3 +1,5 @@
+import { RelayClient, RelayerTxType } from '@polymarket/builder-relayer-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import {
   ClobClient,
   Chain,
@@ -7,10 +9,14 @@ import {
   PriceHistoryInterval,
 } from '@polymarket/clob-client';
 import { Wallet, Contract, constants, utils, providers } from 'ethers';
+import { createWalletClient, fallback as viemFallback, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
 
 import { isReadOnly } from '../config';
 
 import type { PolymarketConfig } from '../config';
+import type { Transaction } from '@polymarket/builder-relayer-client';
 import type {
   ApiKeyCreds,
   BalanceAllowanceResponse,
@@ -25,6 +31,7 @@ import type {
   MarketPrice,
   PriceHistoryFilterParams,
 } from '@polymarket/clob-client';
+import type { Hex } from 'viem';
 
 const CLOB_HOST = 'https://clob.polymarket.com';
 const POLYGON_CHAIN_ID = Chain.POLYGON;
@@ -43,6 +50,13 @@ const NEG_RISK_REDEEM_ABI = [
 const SAFE_EXEC_ABI = [
   'function execTransaction(address to, uint256 value, bytes calldata data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes memory signatures) external payable returns (bool)',
 ];
+const RELAYER_URL = 'https://relayer-v2.polymarket.com/';
+
+type RedeemResult = {
+  transactionHash: string;
+  path: 'gasless' | 'onchain';
+  relayerTransactionId?: string;
+};
 
 export { Side, OrderType, AssetType, PriceHistoryInterval };
 export type {
@@ -262,31 +276,72 @@ export class PolymarketClient {
 
   // ─── On-chain (redeem) ──────────────────────────────────────
 
-  public async redeemPositions(
-    conditionId: string,
-    tokenIds: string[],
-    negRisk: boolean
-  ): Promise<{ transactionHash: string }> {
-    if (!this.wallet) {
+  private createRpcProvider(): providers.FallbackProvider {
+    const network = { name: 'matic', chainId: 137 };
+    const configs = this.config.rpcUrls.map((url, index) => ({
+      provider: new providers.StaticJsonRpcProvider(url, network),
+      priority: index + 1,
+      stallTimeout: 2_000,
+      weight: 1,
+    }));
+
+    return new providers.FallbackProvider(configs, 1);
+  }
+
+  private normalizePrivateKey(privateKey: string): Hex {
+    return (
+      privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`
+    ) as Hex;
+  }
+
+  private createRelayWalletClient() {
+    if (!this.config.privateKey) {
       throw new Error('No private key configured');
     }
-    const safeAddress = this.config.funderAddress;
-    if (!safeAddress) {
+
+    const account = privateKeyToAccount(
+      this.normalizePrivateKey(this.config.privateKey)
+    );
+
+    return createWalletClient({
+      account,
+      chain: polygon,
+      transport: viemFallback(this.config.rpcUrls.map((url) => http(url))),
+    });
+  }
+
+  private getRedeemHolderAddress(): string {
+    if (this.config.signatureType === 0) {
+      if (!this.wallet) {
+        throw new Error('No private key configured');
+      }
+      return this.wallet.address;
+    }
+
+    const holderAddress = this.proxyAddress;
+    if (!holderAddress) {
       throw new Error(
-        'POLYMARKET_FUNDER_ADDRESS required for on-chain redemption'
+        'POLYMARKET_FUNDER_ADDRESS required to determine redeemable position balances'
       );
     }
 
-    const provider = new providers.JsonRpcProvider(this.config.rpcUrl);
-    const signer = this.wallet.connect(provider);
+    return holderAddress;
+  }
 
+  private async createRedeemTransaction(
+    provider: providers.Provider,
+    conditionId: string,
+    tokenIds: string[],
+    negRisk: boolean
+  ): Promise<Transaction> {
     let targetContract: string;
     let calldata: string;
 
     if (negRisk) {
+      const holderAddress = this.getRedeemHolderAddress();
       const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
       const balances = await Promise.all(
-        tokenIds.map((tid) => ctf.balanceOf(safeAddress, tid))
+        tokenIds.map((tid) => ctf.balanceOf(holderAddress, tid))
       );
       const iface = new utils.Interface(NEG_RISK_REDEEM_ABI);
       targetContract = NEG_RISK_ADAPTER;
@@ -305,22 +360,115 @@ export class PolymarketClient {
       ]);
     }
 
-    const signature = utils.solidityPack(
-      ['bytes32', 'bytes32', 'uint8'],
-      [utils.hexZeroPad(signer.address, 32), constants.HashZero, 1]
+    return {
+      to: targetContract,
+      data: calldata,
+      value: '0',
+    };
+  }
+
+  private async redeemPositionsGasless(
+    conditionId: string,
+    tokenIds: string[],
+    negRisk: boolean
+  ): Promise<RedeemResult> {
+    if (!this.config.builderRelayer) {
+      throw new Error('Builder relayer credentials are not configured');
+    }
+
+    const provider = this.createRpcProvider();
+    const relayClient = new RelayClient(
+      this.config.builderRelayer.relayerUrl || RELAYER_URL,
+      POLYGON_CHAIN_ID,
+      this.createRelayWalletClient(),
+      new BuilderConfig({
+        localBuilderCreds: {
+          key: this.config.builderRelayer.apiKey,
+          secret: this.config.builderRelayer.secret,
+          passphrase: this.config.builderRelayer.passphrase,
+        },
+      }),
+      this.config.signatureType === 1 ? RelayerTxType.PROXY : RelayerTxType.SAFE
     );
 
-    const safe = new Contract(safeAddress, SAFE_EXEC_ABI, signer);
+    const transaction = await this.createRedeemTransaction(
+      provider,
+      conditionId,
+      tokenIds,
+      negRisk
+    );
+    const response = await relayClient.execute(
+      [transaction],
+      'Redeem positions'
+    );
+    const result = await response.wait();
+
+    if (!result?.transactionHash) {
+      throw new Error('Gasless redeem transaction did not reach confirmation');
+    }
+
+    return {
+      transactionHash: result.transactionHash,
+      path: 'gasless',
+      relayerTransactionId: response.transactionID,
+    };
+  }
+
+  private async redeemPositionsOnChain(
+    conditionId: string,
+    tokenIds: string[],
+    negRisk: boolean
+  ): Promise<RedeemResult> {
+    if (!this.wallet) {
+      throw new Error('No private key configured');
+    }
+
+    const provider = this.createRpcProvider();
+    const signer = this.wallet.connect(provider);
+    const transaction = await this.createRedeemTransaction(
+      provider,
+      conditionId,
+      tokenIds,
+      negRisk
+    );
     const minTip = utils.parseUnits('30', 'gwei');
     const feeData = await provider.getFeeData();
     const basePriority = feeData.maxPriorityFeePerGas ?? minTip;
     const maxPriority = basePriority.lt(minTip) ? minTip : basePriority;
     const maxFee = (feeData.maxFeePerGas ?? maxPriority).add(maxPriority);
 
+    if (this.config.signatureType === 0) {
+      const tx = await signer.sendTransaction({
+        to: transaction.to,
+        data: transaction.data,
+        value: 0,
+        maxPriorityFeePerGas: maxPriority,
+        maxFeePerGas: maxFee,
+      });
+      const receipt = await tx.wait();
+      return {
+        transactionHash: receipt.transactionHash,
+        path: 'onchain',
+      };
+    }
+
+    const safeAddress = this.config.funderAddress;
+    if (!safeAddress) {
+      throw new Error(
+        'POLYMARKET_FUNDER_ADDRESS required for on-chain redemption fallback'
+      );
+    }
+
+    const signature = utils.solidityPack(
+      ['bytes32', 'bytes32', 'uint8'],
+      [utils.hexZeroPad(signer.address, 32), constants.HashZero, 1]
+    );
+
+    const safe = new Contract(safeAddress, SAFE_EXEC_ABI, signer);
     const tx = await safe.execTransaction(
-      targetContract,
+      transaction.to,
       0,
-      calldata,
+      transaction.data,
       0,
       0,
       0,
@@ -332,6 +480,42 @@ export class PolymarketClient {
     );
 
     const receipt = await tx.wait();
-    return { transactionHash: receipt.transactionHash };
+    return {
+      transactionHash: receipt.transactionHash,
+      path: 'onchain',
+    };
+  }
+
+  public async redeemPositions(
+    conditionId: string,
+    tokenIds: string[],
+    negRisk: boolean,
+    method: 'auto' | 'gasless' | 'onchain' = 'auto'
+  ): Promise<RedeemResult> {
+    if (method === 'gasless') {
+      return this.redeemPositionsGasless(conditionId, tokenIds, negRisk);
+    }
+
+    if (method === 'onchain') {
+      return this.redeemPositionsOnChain(conditionId, tokenIds, negRisk);
+    }
+
+    if (this.config.builderRelayer) {
+      try {
+        return await this.redeemPositionsGasless(
+          conditionId,
+          tokenIds,
+          negRisk
+        );
+      } catch (error) {
+        console.error(
+          `[polymarket] Gasless redeem failed, falling back to on-chain transaction: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    return this.redeemPositionsOnChain(conditionId, tokenIds, negRisk);
   }
 }
