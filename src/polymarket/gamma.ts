@@ -204,6 +204,10 @@ export async function listMarkets(params: {
   end_date_min?: string;
   end_date_max?: string;
   tag_id?: number;
+  liquidity_num_min?: number;
+  liquidity_num_max?: number;
+  volume_num_min?: number;
+  volume_num_max?: number;
 }): Promise<GammaMarket[]> {
   return gammaGet<GammaMarket[]>('/markets', {
     limit: params.limit ?? 20,
@@ -215,6 +219,10 @@ export async function listMarkets(params: {
     end_date_min: params.end_date_min,
     end_date_max: params.end_date_max,
     tag_id: params.tag_id,
+    liquidity_num_min: params.liquidity_num_min,
+    liquidity_num_max: params.liquidity_num_max,
+    volume_num_min: params.volume_num_min,
+    volume_num_max: params.volume_num_max,
   });
 }
 

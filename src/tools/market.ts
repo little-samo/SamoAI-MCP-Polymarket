@@ -37,6 +37,21 @@ function parseMarketFields(market: GammaMarket) {
   return { outcomes, prices, tokenIds };
 }
 
+function matchesPriceFilter(
+  market: GammaMarket,
+  priceMin?: number,
+  priceMax?: number
+): boolean {
+  if (priceMin === undefined && priceMax === undefined) return true;
+
+  const { prices } = parseMarketFields(market);
+  return prices.some((p) => {
+    if (priceMin !== undefined && p < priceMin) return false;
+    if (priceMax !== undefined && p > priceMax) return false;
+    return true;
+  });
+}
+
 export function registerMarketTools(
   server: McpServer,
   client: PolymarketClient
@@ -93,10 +108,6 @@ export function registerMarketTools(
           .min(0)
           .default(0)
           .describe('Pagination offset'),
-        order: z
-          .enum(['volume', 'liquidity', 'competitive'])
-          .default('volume')
-          .describe('Sort field'),
       }),
     },
     async ({
@@ -109,7 +120,6 @@ export function registerMarketTools(
       volume_min,
       limit,
       offset,
-      order,
     }) => {
       try {
         const now = Date.now();
@@ -125,6 +135,8 @@ export function registerMarketTools(
             : undefined;
 
         let markets: GammaMarket[];
+        let totalFound: number | null = null;
+        let serverPagedResults = false;
 
         if (query) {
           const results = await searchMarkets(query, 100);
@@ -148,44 +160,79 @@ export function registerMarketTools(
               return true;
             });
           }
+          totalFound = markets.length;
         } else {
-          markets = await listMarkets({
-            limit: 100,
-            offset: 0,
+          const serverParams = {
             active: true,
             closed: false,
-            order,
+            order: 'volume',
             ascending: false,
             end_date_min: endDateMin,
             end_date_max: endDateMax,
-          });
+            liquidity_num_min: liquidity_min,
+            volume_num_min: volume_min,
+          } as const;
+
+          if (price_min === undefined && price_max === undefined) {
+            markets = await listMarkets({
+              ...serverParams,
+              limit,
+              offset,
+            });
+            serverPagedResults = true;
+          } else {
+            const pageSize = 100;
+            const targetCount = offset + limit;
+            const filteredMarkets: GammaMarket[] = [];
+            let serverOffset = 0;
+
+            while (filteredMarkets.length < targetCount) {
+              const page = await listMarkets({
+                ...serverParams,
+                limit: pageSize,
+                offset: serverOffset,
+              });
+              if (page.length === 0) break;
+
+              filteredMarkets.push(
+                ...page.filter((market) =>
+                  matchesPriceFilter(market, price_min, price_max)
+                )
+              );
+
+              if (page.length < pageSize) break;
+              serverOffset += pageSize;
+            }
+
+            markets = filteredMarkets;
+            totalFound = filteredMarkets.length;
+          }
         }
 
         markets = markets.filter((m) => m.active && !m.closed);
 
-        if (price_min !== undefined || price_max !== undefined) {
-          markets = markets.filter((m) => {
-            const { prices } = parseMarketFields(m);
-            return prices.some((p) => {
-              if (price_min !== undefined && p < price_min) return false;
-              if (price_max !== undefined && p > price_max) return false;
-              return true;
-            });
-          });
-        }
-
-        if (liquidity_min !== undefined) {
-          markets = markets.filter((m) => Number(m.liquidity) >= liquidity_min);
-        }
-        if (volume_min !== undefined) {
-          markets = markets.filter((m) => Number(m.volume) >= volume_min);
-        }
-
         if (query) {
-          markets.sort((a, b) => Number(b.volume) - Number(a.volume));
+          if (price_min !== undefined || price_max !== undefined) {
+            markets = markets.filter((m) =>
+              matchesPriceFilter(m, price_min, price_max)
+            );
+          }
+
+          if (liquidity_min !== undefined) {
+            markets = markets.filter(
+              (m) => Number(m.liquidity) >= liquidity_min
+            );
+          }
+          if (volume_min !== undefined) {
+            markets = markets.filter((m) => Number(m.volume) >= volume_min);
+          }
+
+          totalFound = markets.length;
         }
 
-        const paged = markets.slice(offset, offset + limit);
+        const paged = serverPagedResults
+          ? markets
+          : markets.slice(offset, offset + limit);
 
         const result = paged.map((m) => {
           const { outcomes, prices, tokenIds } = parseMarketFields(m);
@@ -205,7 +252,7 @@ export function registerMarketTools(
         });
 
         return formatResult({
-          total_found: markets.length,
+          total_found: totalFound,
           count: result.length,
           markets: result,
         });
