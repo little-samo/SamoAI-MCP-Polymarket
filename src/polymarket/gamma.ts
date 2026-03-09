@@ -181,10 +181,23 @@ export async function getEventById(id: string): Promise<GammaEvent | null> {
 export async function getMarketByConditionId(
   conditionId: string
 ): Promise<GammaMarket | null> {
-  const results = await gammaGet<GammaMarket[]>('/markets', {
-    condition_ids: conditionId,
-  });
+  const results = await getMarketsByConditionIds([conditionId]);
   return results[0] ?? null;
+}
+
+export async function getMarketsByConditionIds(
+  conditionIds: string[]
+): Promise<GammaMarket[]> {
+  const normalized = [
+    ...new Set(conditionIds.map((id) => id.trim()).filter(Boolean)),
+  ];
+  if (normalized.length === 0) {
+    return [];
+  }
+
+  return gammaGet<GammaMarket[]>('/markets', {
+    condition_ids: normalized.join(','),
+  });
 }
 
 export async function getMarketBySlug(

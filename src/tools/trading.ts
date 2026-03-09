@@ -1,12 +1,63 @@
 import { z } from 'zod';
 
 import { Side } from '../polymarket/client';
-import { getMarketByConditionId } from '../polymarket/gamma';
+import { getMarketsByConditionIds } from '../polymarket/gamma';
 
 import { formatResult, formatError, requireAuth } from './utils';
 
 import type { PolymarketClient } from '../polymarket/client';
+import type { GammaMarket } from '../polymarket/gamma';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+function normalizeConditionIds(
+  conditionId?: string,
+  conditionIds?: string[]
+): string[] {
+  return [
+    ...new Set(
+      [conditionId, ...(conditionIds ?? [])]
+        .map((value) => value?.trim())
+        .filter((value): value is string => Boolean(value))
+    ),
+  ];
+}
+
+function parseTokenIds(market: GammaMarket): string[] {
+  const tokenIds = JSON.parse(market.clobTokenIds);
+  if (
+    !Array.isArray(tokenIds) ||
+    tokenIds.some((tokenId) => typeof tokenId !== 'string')
+  ) {
+    throw new Error('Could not parse token IDs from market data');
+  }
+
+  return tokenIds;
+}
+
+async function settleRedeemTasks<T>(
+  tasks: Array<() => Promise<T>>,
+  sequential: boolean
+): Promise<PromiseSettledResult<T>[]> {
+  if (!sequential) {
+    return Promise.allSettled(tasks.map((task) => task()));
+  }
+
+  const settled: PromiseSettledResult<T>[] = [];
+  for (const task of tasks) {
+    try {
+      settled.push({
+        status: 'fulfilled',
+        value: await task(),
+      });
+    } catch (error) {
+      settled.push({
+        status: 'rejected',
+        reason: error,
+      });
+    }
+  }
+  return settled;
+}
 
 export function registerTradingTools(
   server: McpServer,
@@ -122,43 +173,121 @@ export function registerTradingTools(
     'redeem_positions',
     {
       description:
-        'Redeem (claim) winning positions after market resolution. Uses Polymarket builder relayer for gasless claim when configured, otherwise falls back to an on-chain transaction. Use get_positions to find redeemable positions.',
-      inputSchema: z.object({
-        condition_id: z
-          .string()
-          .min(1)
-          .describe('Market condition ID to redeem'),
-        method: z
-          .enum(['auto', 'gasless', 'onchain'])
-          .default('auto')
-          .describe(
-            'Claim method: gasless (builder relayer), onchain (direct tx), or auto (gasless with onchain fallback)'
-          ),
-      }),
+        'Redeem (claim) one or more winning positions after market resolution. Uses Polymarket builder relayer for gasless claim when configured, otherwise falls back to an on-chain transaction.',
+      inputSchema: z
+        .object({
+          condition_id: z
+            .string()
+            .min(1)
+            .optional()
+            .describe('Single market condition ID to redeem'),
+          condition_ids: z
+            .array(z.string().min(1))
+            .optional()
+            .describe('Multiple market condition IDs to redeem in one call'),
+          method: z
+            .enum(['auto', 'gasless', 'onchain'])
+            .default('auto')
+            .describe(
+              'Claim method: gasless (builder relayer), onchain (direct tx), or auto (gasless with onchain fallback)'
+            ),
+        })
+        .refine(
+          (value) =>
+            Boolean(value.condition_id?.trim()) ||
+            Boolean(
+              value.condition_ids?.some((conditionId) => conditionId.trim())
+            ),
+          {
+            message: 'Provide condition_id or condition_ids',
+            path: ['condition_id'],
+          }
+        ),
     },
-    async ({ condition_id, method }) => {
+    async ({ condition_id, condition_ids, method }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       try {
-        const market = await getMarketByConditionId(condition_id);
-        if (!market) return formatError('Market not found');
+        const requestedConditionIds = normalizeConditionIds(
+          condition_id,
+          condition_ids
+        );
+        const markets = await getMarketsByConditionIds(requestedConditionIds);
+        const marketsByConditionId = new Map(
+          markets.map((market) => [market.conditionId, market])
+        );
 
-        let tokenIds: string[] = [];
-        try {
-          tokenIds = JSON.parse(market.clobTokenIds);
-        } catch {
-          return formatError('Could not parse token IDs from market data');
+        if (requestedConditionIds.length === 1) {
+          const market = marketsByConditionId.get(requestedConditionIds[0]);
+          if (!market) return formatError('Market not found');
+
+          const result = await client.redeemPositions(
+            market.conditionId,
+            parseTokenIds(market),
+            market.negRisk,
+            method
+          );
+          return formatResult({
+            success: true,
+            conditionId: market.conditionId,
+            ...result,
+          });
         }
 
-        const result = await client.redeemPositions(
-          condition_id,
-          tokenIds,
-          market.negRisk,
-          method
+        const redeemTasks = requestedConditionIds.map(
+          (requestedConditionId) => async () => {
+            const market = marketsByConditionId.get(requestedConditionId);
+            if (!market) {
+              throw new Error('Market not found');
+            }
+
+            const result = await client.redeemPositions(
+              market.conditionId,
+              parseTokenIds(market),
+              market.negRisk,
+              method
+            );
+
+            return {
+              success: true,
+              conditionId: market.conditionId,
+              ...result,
+            };
+          }
         );
+        const settled = await settleRedeemTasks(
+          redeemTasks,
+          method === 'onchain' ||
+            (method === 'auto' && !client.hasBuilderRelayer)
+        );
+
+        const results: Array<Record<string, unknown>> = [];
+        const failures: Array<{ conditionId: string; error: string }> = [];
+
+        settled.forEach((entry, index) => {
+          const requestedConditionId = requestedConditionIds[index];
+          if (entry.status === 'fulfilled') {
+            results.push(entry.value);
+            return;
+          }
+
+          const error =
+            entry.reason instanceof Error
+              ? entry.reason.message
+              : String(entry.reason);
+          failures.push({
+            conditionId: requestedConditionId,
+            error,
+          });
+        });
+
         return formatResult({
-          success: true,
-          ...result,
+          success: failures.length === 0,
+          requestedCount: requestedConditionIds.length,
+          redeemedCount: results.length,
+          failedCount: failures.length,
+          results,
+          failures,
         });
       } catch (e) {
         return formatError(e);

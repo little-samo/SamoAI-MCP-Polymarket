@@ -52,6 +52,28 @@ function matchesPriceFilter(
   });
 }
 
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getTopOfBookMetrics(book: {
+  bids?: Array<{ price: string }>;
+  asks?: Array<{ price: string }>;
+}): { midpoint: number | null; spread: number | null } {
+  const bestBid = toFiniteNumber(book.bids?.[0]?.price);
+  const bestAsk = toFiniteNumber(book.asks?.[0]?.price);
+
+  if (bestBid === null || bestAsk === null) {
+    return { midpoint: null, spread: null };
+  }
+
+  return {
+    midpoint: Number(((bestBid + bestAsk) / 2).toFixed(6)),
+    spread: Number((bestAsk - bestBid).toFixed(6)),
+  };
+}
+
 export function registerMarketTools(
   server: McpServer,
   client: PolymarketClient
@@ -241,6 +263,7 @@ export function registerMarketTools(
             conditionId: m.conditionId,
             slug: m.slug,
             endDate: m.endDate,
+            negRisk: m.negRisk,
             outcomes: outcomes.map((o, i) => ({
               name: o,
               price: prices[i],
@@ -318,6 +341,7 @@ export function registerMarketTools(
           closed: market.closed,
           volume: market.volume,
           liquidity: market.liquidity,
+          negRisk: market.negRisk,
           outcomes: outcomes.map((o, i) => ({
             name: o,
             price: prices[i],
@@ -328,21 +352,21 @@ export function registerMarketTools(
         if (include_orderbook && tokenIds.length > 0) {
           const books = await Promise.all(
             tokenIds.map(async (tid, i) => {
-              const [book, mid, spread] = await Promise.all([
-                client.getOrderBook(tid),
-                client.getMidpoint(tid),
-                client.getSpread(tid),
-              ]);
+              const book = await client.getOrderBook(tid);
               const sortedBids = [...(book.bids ?? [])].sort(
                 (a, b) => Number(b.price) - Number(a.price)
               );
               const sortedAsks = [...(book.asks ?? [])].sort(
                 (a, b) => Number(a.price) - Number(b.price)
               );
+              const { midpoint, spread } = getTopOfBookMetrics({
+                bids: sortedBids,
+                asks: sortedAsks,
+              });
               return {
                 outcome: outcomes[i],
                 tokenId: tid,
-                midpoint: mid,
+                midpoint,
                 spread,
                 bids: sortedBids.slice(0, 5),
                 asks: sortedAsks.slice(0, 5),

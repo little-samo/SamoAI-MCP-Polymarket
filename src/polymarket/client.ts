@@ -101,6 +101,10 @@ export class PolymarketClient {
     return this.config.funderAddress ?? this.wallet?.address ?? null;
   }
 
+  public get hasBuilderRelayer(): boolean {
+    return Boolean(this.config.builderRelayer);
+  }
+
   public async initTrading(): Promise<void> {
     if (!this.wallet) {
       throw new Error('No private key configured — running in read-only mode');
