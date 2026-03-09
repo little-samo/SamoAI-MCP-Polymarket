@@ -28,39 +28,22 @@
 
 | Tool | Description |
 |------|-------------|
-| `search_markets` | Search markets by keyword |
-| `get_market` | Get detailed market info by condition ID or slug |
-| `get_event` | Get detailed event info by ID or slug |
-| `list_events` | Browse active events with pagination |
-| `list_markets` | List markets with filters and sorting |
-| `find_ending_soon` | Find markets ending within N hours |
-| `get_orderbook` | Get bids/asks for a token |
-| `get_price` | Get midpoint, spread, and last trade price |
-| `get_prices_history` | Get historical price data for a token |
-| `get_market_trades` | Get recent trades for a market or event |
-| `get_open_interest` | Get open interest for markets |
-| `list_tags` | List market tags/categories |
+| `find_markets` | Search and filter active markets by keyword, time-to-expiry, price range, liquidity, and volume |
+| `get_market` | Get detailed market info by condition ID or slug, with optional orderbooks, recent trades, and price history |
 
 ### Account (auth required)
 
 | Tool | Description |
 |------|-------------|
-| `get_balance` | Get USDC or token balance and allowance |
-| `get_positions` | Get current open positions with P&L |
-| `get_open_orders` | List open orders with optional filters |
-| `get_order` | Get details of a specific order |
-| `get_trades` | Get trade history |
+| `get_account` | Get wallet balance, portfolio summary, positions, open orders, and trade history in one call |
 
 ### Trading (auth required)
 
 | Tool | Description |
 |------|-------------|
-| `create_order` | Place a limit order (auto-detects tick size) |
-| `create_market_order` | Place a market order |
-| `cancel_order` | Cancel a specific order |
-| `cancel_orders` | Cancel multiple orders by IDs |
-| `cancel_all_orders` | Cancel all open orders |
-| `cancel_market_orders` | Cancel all orders for a specific market/token |
+| `place_order` | Place a limit or market order for a token |
+| `cancel_orders` | Cancel specific orders, all orders in a market/token, or all open orders |
+| `redeem_positions` | Claim winning positions after market resolution, with gasless or on-chain execution |
 
 ## Installation
 
@@ -149,12 +132,12 @@ Returns server status, mode (read-only/trading), and wallet address.
 
 A typical agent flow for discovering and trading on a market:
 
-1. **Search** — `search_markets({ query: "US election" })` to find relevant markets
-2. **Inspect** — `get_market({ condition_id: "..." })` to see token IDs, outcomes, and fees
-3. **Analyze** — `get_orderbook({ token_id: "..." })` and `get_price({ token_id: "..." })` for price data
-4. **Check Balance** — `get_balance()` to verify available USDC
-5. **Trade** — `create_order({ token_id, side: "BUY", price: 0.65, size: 100 })` to place a limit order
-6. **Monitor** — `get_open_orders()` and `get_order({ order_id: "..." })` to track order status
+1. **Search** — `find_markets({ query: "US election", limit: 10 })` to find relevant markets
+2. **Inspect** — `get_market({ condition_id: "...", include_orderbook: true })` to see token IDs, outcomes, and top-of-book liquidity
+3. **Analyze** — `get_market({ condition_id: "...", include_trades: true, include_history: true })` to review recent flow and price history
+4. **Check Account** — `get_account({ sections: ["balance", "positions"] })` to verify cash balance and current portfolio value
+5. **Trade** — `place_order({ token_id, side: "BUY", type: "limit", price: 0.65, size: 100 })` to place a limit order
+6. **Monitor** — `get_account({ sections: ["orders"] })` to review open orders, then `cancel_orders({ order_ids: ["..."] })` if needed
 
 ## Tech Stack
 
