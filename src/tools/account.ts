@@ -1,13 +1,36 @@
 import { z } from 'zod';
 
-import { getPositions } from '../polymarket/gamma';
+import {
+  getMarketByConditionId,
+  getMarketsByConditionIds,
+  getPositions,
+} from '../polymarket/gamma';
 
 import { formatResult, formatError, requireAuth } from './utils';
 
 import type { PolymarketClient } from '../polymarket/client';
+import type { GammaMarket, GammaPosition } from '../polymarket/gamma';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 const USDC_DECIMALS = 6;
+const RESOLUTION_PRICE_EPSILON = 1e-6;
+
+type PositionStatus =
+  | 'open'
+  | 'claimable'
+  | 'redeemable'
+  | 'settled_loss'
+  | 'closed';
+
+interface AccountPositionView {
+  position: GammaPosition;
+  status: PositionStatus;
+  settlementPrice: number | null;
+  claimableValue: number;
+  effectiveCurrentValue: number;
+  effectiveCashPnl: number;
+  effectivePercentPnl: number;
+}
 
 function formatUsdcAmount(value: unknown): string {
   if (value === null || value === undefined) return '0';
@@ -53,6 +76,114 @@ function roundDecimal(value: number, decimals: number = 6): number {
   return Number(value.toFixed(decimals));
 }
 
+function parseStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item));
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNumberArray(value: unknown): number[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => toFiniteNumber(item));
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.map((item) => toFiniteNumber(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function getSettlementPrice(
+  position: GammaPosition,
+  market?: GammaMarket
+): number | null {
+  if (!market) return null;
+
+  const outcomePrices = parseNumberArray(market.outcomePrices);
+  if (outcomePrices.length === 0) return null;
+
+  const outcomeIndex = Number.isInteger(position.outcomeIndex)
+    ? position.outcomeIndex
+    : parseStringArray(market.outcomes).findIndex(
+        (outcome) => outcome === position.outcome
+      );
+
+  if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
+    return null;
+  }
+
+  return outcomePrices[outcomeIndex];
+}
+
+function buildPositionView(
+  position: GammaPosition,
+  market?: GammaMarket
+): AccountPositionView {
+  const settlementPrice = getSettlementPrice(position, market);
+  const initialValue = toFiniteNumber(position.initialValue);
+  const size = toFiniteNumber(position.size);
+  const currentValue = toFiniteNumber(position.currentValue);
+  const rawCashPnl = toFiniteNumber(position.cashPnl);
+
+  let status: PositionStatus = 'open';
+  if (position.redeemable) {
+    if (settlementPrice !== null) {
+      status =
+        settlementPrice <= RESOLUTION_PRICE_EPSILON
+          ? 'settled_loss'
+          : 'claimable';
+    } else {
+      status = 'redeemable';
+    }
+  } else if (market?.closed && currentValue <= RESOLUTION_PRICE_EPSILON) {
+    status = 'closed';
+  }
+
+  const claimableValue =
+    status === 'claimable' && settlementPrice !== null
+      ? roundDecimal(size * settlementPrice)
+      : 0;
+  const effectiveCurrentValue =
+    status === 'claimable' ? claimableValue : roundDecimal(currentValue);
+  const effectiveCashPnl =
+    status === 'claimable'
+      ? roundDecimal(effectiveCurrentValue - initialValue)
+      : roundDecimal(rawCashPnl);
+  const effectivePercentPnl =
+    initialValue > 0
+      ? roundDecimal((effectiveCashPnl / initialValue) * 100)
+      : 0;
+
+  return {
+    position,
+    status,
+    settlementPrice,
+    claimableValue,
+    effectiveCurrentValue,
+    effectiveCashPnl,
+    effectivePercentPnl,
+  };
+}
+
 export function registerAccountTools(
   server: McpServer,
   client: PolymarketClient
@@ -61,12 +192,25 @@ export function registerAccountTools(
     'get_account',
     {
       description:
-        'Get account overview: USDC balance, open positions, pending orders, and/or trade history. Combine multiple sections in one call to minimize round-trips.',
+        'Get account overview: USDC balance, economically active positions, pending orders, and/or trade history. Resolved losses are broken out separately so stale dust does not look like an open holding.',
       inputSchema: z.object({
         sections: z
           .array(z.enum(['balance', 'positions', 'orders', 'trades']))
           .default(['balance', 'positions', 'orders'])
           .describe('Data sections to include'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(500)
+          .default(100)
+          .describe('Page size for the positions section'),
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .default(0)
+          .describe('Pagination offset for the positions section'),
         market: z
           .string()
           .optional()
@@ -79,7 +223,7 @@ export function registerAccountTools(
           ),
       }),
     },
-    async ({ sections, market, order_id }) => {
+    async ({ sections, limit, offset, market, order_id }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       const proxyAddr = client.proxyAddress;
@@ -91,6 +235,8 @@ export function registerAccountTools(
         const includeBalance = sections.includes('balance');
         const includePositions = sections.includes('positions');
         const includePortfolioSummary = includeBalance || includePositions;
+        const requestedLimit = limit;
+        const requestedOffset = offset;
         let cashUsd = 0;
         let totalCurrentValue = 0;
         let totalInitialValue = 0;
@@ -116,55 +262,167 @@ export function registerAccountTools(
 
         if (includePortfolioSummary) {
           tasks.push(
-            getPositions(proxyAddr, { market, limit: 100 }).then(
-              (positions) => {
-                totalCurrentValue = roundDecimal(
-                  positions.reduce(
-                    (sum, position) =>
-                      sum + toFiniteNumber(position.currentValue),
-                    0
-                  )
-                );
-                totalInitialValue = roundDecimal(
-                  positions.reduce(
-                    (sum, position) =>
-                      sum + toFiniteNumber(position.initialValue),
-                    0
-                  )
-                );
-                totalCashPnl = roundDecimal(
-                  positions.reduce(
-                    (sum, position) => sum + toFiniteNumber(position.cashPnl),
-                    0
-                  )
-                );
-                positionCount = positions.length;
+            getPositions(proxyAddr, {
+              market,
+              limit: requestedLimit,
+              offset: requestedOffset,
+            }).then(async (positions) => {
+              const hasMoreProbe =
+                positions.length === requestedLimit
+                  ? await getPositions(proxyAddr, {
+                      market,
+                      limit: 1,
+                      offset: requestedOffset + requestedLimit,
+                    })
+                  : [];
+              const hasMore = hasMoreProbe.length > 0;
+              const markets = await getMarketsByConditionIds(
+                positions.map((position) => position.conditionId)
+              );
+              const marketsByConditionId = new Map(
+                markets.map((positionMarket) => [
+                  positionMarket.conditionId,
+                  positionMarket,
+                ])
+              );
+              const missingConditionIds = [
+                ...new Set(
+                  positions
+                    .map((position) => position.conditionId)
+                    .filter(
+                      (conditionId) => !marketsByConditionId.has(conditionId)
+                    )
+                ),
+              ];
 
-                if (!includePositions) {
-                  return;
-                }
+              if (missingConditionIds.length > 0) {
+                const fallbackMarkets = await Promise.all(
+                  missingConditionIds.map((conditionId) =>
+                    getMarketByConditionId(conditionId)
+                  )
+                );
 
-                result.positions = {
-                  count: positionCount,
-                  totalCurrentValue,
-                  totalInitialValue,
-                  totalCashPnl,
-                  items: positions.map((p) => ({
-                    title: p.title,
-                    outcome: p.outcome,
-                    size: roundDecimal(toFiniteNumber(p.size)),
-                    avgPrice: roundDecimal(toFiniteNumber(p.avgPrice)),
-                    curPrice: roundDecimal(toFiniteNumber(p.curPrice)),
-                    currentValue: roundDecimal(toFiniteNumber(p.currentValue)),
-                    cashPnl: roundDecimal(toFiniteNumber(p.cashPnl)),
-                    percentPnl: roundDecimal(toFiniteNumber(p.percentPnl)),
-                    conditionId: p.conditionId,
-                    endDate: p.endDate,
-                    redeemable: p.redeemable,
-                  })),
-                };
+                fallbackMarkets.forEach((fallbackMarket) => {
+                  if (fallbackMarket) {
+                    marketsByConditionId.set(
+                      fallbackMarket.conditionId,
+                      fallbackMarket
+                    );
+                  }
+                });
               }
-            )
+
+              const positionViews = positions.map((position) =>
+                buildPositionView(
+                  position,
+                  marketsByConditionId.get(position.conditionId)
+                )
+              );
+              const activePositionViews = positionViews.filter(
+                (view) => view.status !== 'settled_loss'
+              );
+              const settledLossViews = positionViews.filter(
+                (view) => view.status === 'settled_loss'
+              );
+              const claimableViews = positionViews.filter(
+                (view) => view.status === 'claimable'
+              );
+              const settledLossInitialValue = roundDecimal(
+                settledLossViews.reduce(
+                  (sum, view) =>
+                    sum + toFiniteNumber(view.position.initialValue),
+                  0
+                )
+              );
+
+              totalCurrentValue = roundDecimal(
+                activePositionViews.reduce(
+                  (sum, view) => sum + view.effectiveCurrentValue,
+                  0
+                )
+              );
+              totalInitialValue = roundDecimal(
+                activePositionViews.reduce(
+                  (sum, view) =>
+                    sum + toFiniteNumber(view.position.initialValue),
+                  0
+                )
+              );
+              totalCashPnl = roundDecimal(
+                activePositionViews.reduce(
+                  (sum, view) => sum + view.effectiveCashPnl,
+                  0
+                )
+              );
+              positionCount = activePositionViews.length;
+
+              if (!includePositions) {
+                return;
+              }
+
+              result.positions = {
+                count: positionCount,
+                limit: requestedLimit,
+                offset: requestedOffset,
+                hasMore,
+                claimableCount: claimableViews.length,
+                settledLossCount: settledLossViews.length,
+                totalCurrentValue,
+                totalInitialValue,
+                totalCashPnl,
+                settledLossInitialValue,
+                items: activePositionViews.map((view) => ({
+                  title: view.position.title,
+                  outcome: view.position.outcome,
+                  status: view.status,
+                  size: roundDecimal(toFiniteNumber(view.position.size)),
+                  avgPrice: roundDecimal(
+                    toFiniteNumber(view.position.avgPrice)
+                  ),
+                  curPrice: roundDecimal(
+                    toFiniteNumber(view.position.curPrice)
+                  ),
+                  currentValue: view.effectiveCurrentValue,
+                  cashPnl: view.effectiveCashPnl,
+                  percentPnl: view.effectivePercentPnl,
+                  rawCurrentValue: roundDecimal(
+                    toFiniteNumber(view.position.currentValue)
+                  ),
+                  rawCashPnl: roundDecimal(
+                    toFiniteNumber(view.position.cashPnl)
+                  ),
+                  settlementPrice:
+                    view.settlementPrice === null
+                      ? null
+                      : roundDecimal(view.settlementPrice),
+                  claimableValue: view.claimableValue,
+                  conditionId: view.position.conditionId,
+                  endDate: view.position.endDate,
+                  redeemable: view.position.redeemable,
+                })),
+                settledLosses: settledLossViews.map((view) => ({
+                  title: view.position.title,
+                  outcome: view.position.outcome,
+                  status: view.status,
+                  size: roundDecimal(toFiniteNumber(view.position.size)),
+                  avgPrice: roundDecimal(
+                    toFiniteNumber(view.position.avgPrice)
+                  ),
+                  settlementPrice:
+                    view.settlementPrice === null
+                      ? null
+                      : roundDecimal(view.settlementPrice),
+                  currentValue: 0,
+                  cashPnl: roundDecimal(
+                    -toFiniteNumber(view.position.initialValue)
+                  ),
+                  percentPnl: -100,
+                  conditionId: view.position.conditionId,
+                  endDate: view.position.endDate,
+                  redeemable: view.position.redeemable,
+                })),
+              };
+            })
           );
         }
 
@@ -202,6 +460,12 @@ export function registerAccountTools(
             totalInitialValue,
             totalCashPnl,
             positionCount,
+            settledLossCount:
+              typeof result.positions === 'object' &&
+              result.positions !== null &&
+              'settledLossCount' in result.positions
+                ? result.positions.settledLossCount
+                : 0,
           };
         }
 

@@ -43,6 +43,7 @@ const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const CTF_ABI = [
   'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] calldata indexSets)',
   'function balanceOf(address owner, uint256 id) view returns (uint256)',
+  'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
 ];
 const NEG_RISK_REDEEM_ABI = [
   'function redeemPositions(bytes32 conditionId, uint256[] calldata amounts)',
@@ -103,6 +104,10 @@ export class PolymarketClient {
 
   public get hasBuilderRelayer(): boolean {
     return Boolean(this.config.builderRelayer);
+  }
+
+  public get usesSafeSigning(): boolean {
+    return this.config.signatureType === 2;
   }
 
   public async initTrading(): Promise<void> {
@@ -332,6 +337,33 @@ export class PolymarketClient {
     return holderAddress;
   }
 
+  private async validateRedeemable(
+    provider: providers.Provider,
+    conditionId: string,
+    tokenIds: string[],
+    _negRisk: boolean
+  ): Promise<void> {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
+    const denominator = await ctf.payoutDenominator(conditionId);
+    if (denominator.isZero()) {
+      throw new Error(
+        `Condition ${conditionId} is not resolved on-chain yet (payoutDenominator=0). ` +
+          'The market may appear resolved on the API but the oracle has not reported the result to the contract.'
+      );
+    }
+
+    const holderAddress = this.getRedeemHolderAddress();
+    const balances = await Promise.all(
+      tokenIds.map((tid) => ctf.balanceOf(holderAddress, tid))
+    );
+    const hasBalance = balances.some((b) => !b.isZero());
+    if (!hasBalance) {
+      throw new Error(
+        `No token balance for condition ${conditionId} — positions may have already been redeemed`
+      );
+    }
+  }
+
   private async createRedeemTransaction(
     provider: providers.Provider,
     conditionId: string,
@@ -381,6 +413,8 @@ export class PolymarketClient {
     }
 
     const provider = this.createRpcProvider();
+    await this.validateRedeemable(provider, conditionId, tokenIds, negRisk);
+
     const relayClient = new RelayClient(
       this.config.builderRelayer.relayerUrl || RELAYER_URL,
       POLYGON_CHAIN_ID,
@@ -428,6 +462,8 @@ export class PolymarketClient {
     }
 
     const provider = this.createRpcProvider();
+    await this.validateRedeemable(provider, conditionId, tokenIds, negRisk);
+
     const signer = this.wallet.connect(provider);
     const transaction = await this.createRedeemTransaction(
       provider,

@@ -1,13 +1,19 @@
 import { z } from 'zod';
 
 import { Side } from '../polymarket/client';
-import { getMarketsByConditionIds } from '../polymarket/gamma';
+import {
+  getMarketByConditionId,
+  getMarketsByConditionIds,
+  getPositions,
+} from '../polymarket/gamma';
 
 import { formatResult, formatError, requireAuth } from './utils';
 
 import type { PolymarketClient } from '../polymarket/client';
-import type { GammaMarket } from '../polymarket/gamma';
+import type { GammaMarket, GammaPosition } from '../polymarket/gamma';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+const RESOLUTION_PRICE_EPSILON = 1e-6;
 
 function normalizeConditionIds(
   conditionId?: string,
@@ -32,6 +38,160 @@ function parseTokenIds(market: GammaMarket): string[] {
   }
 
   return tokenIds;
+}
+
+function toFiniteNumber(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item));
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNumberArray(value: unknown): number[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => toFiniteNumber(item));
+  }
+
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.map((item) => toFiniteNumber(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function getSettlementPrice(
+  position: GammaPosition,
+  market?: GammaMarket
+): number | null {
+  if (!market) return null;
+
+  const outcomePrices = parseNumberArray(market.outcomePrices);
+  if (outcomePrices.length === 0) return null;
+
+  const outcomeIndex = Number.isInteger(position.outcomeIndex)
+    ? position.outcomeIndex
+    : parseStringArray(market.outcomes).findIndex(
+        (outcome) => outcome === position.outcome
+      );
+
+  if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
+    return null;
+  }
+
+  return outcomePrices[outcomeIndex];
+}
+
+async function loadMarketsByConditionIds(
+  conditionIds: string[]
+): Promise<Map<string, GammaMarket>> {
+  const normalizedConditionIds = [...new Set(conditionIds.filter(Boolean))];
+  if (normalizedConditionIds.length === 0) {
+    return new Map();
+  }
+
+  const markets = await getMarketsByConditionIds(normalizedConditionIds);
+  const marketsByConditionId = new Map(
+    markets.map((market) => [market.conditionId, market])
+  );
+  const missingConditionIds = normalizedConditionIds.filter(
+    (conditionId) => !marketsByConditionId.has(conditionId)
+  );
+
+  if (missingConditionIds.length > 0) {
+    const fallbackMarkets = await Promise.all(
+      missingConditionIds.map((conditionId) =>
+        getMarketByConditionId(conditionId)
+      )
+    );
+
+    fallbackMarkets.forEach((market) => {
+      if (market) {
+        marketsByConditionId.set(market.conditionId, market);
+      }
+    });
+  }
+
+  return marketsByConditionId;
+}
+
+async function getAllPositions(
+  userAddress: string,
+  params?: { market?: string; pageSize?: number }
+): Promise<GammaPosition[]> {
+  const pageSize = params?.pageSize ?? 100;
+  const positions: GammaPosition[] = [];
+  let offset = 0;
+
+  while (true) {
+    const page = await getPositions(userAddress, {
+      market: params?.market,
+      limit: pageSize,
+      offset,
+    });
+
+    positions.push(...page);
+
+    if (page.length < pageSize) {
+      break;
+    }
+
+    offset += pageSize;
+  }
+
+  return positions;
+}
+
+async function getRedeemableSettledLossConditionIds(
+  userAddress: string
+): Promise<string[]> {
+  const positions = await getAllPositions(userAddress);
+  const marketsByConditionId = await loadMarketsByConditionIds(
+    positions.map((position) => position.conditionId)
+  );
+
+  return [
+    ...new Set(
+      positions
+        .filter((position) => {
+          if (!position.redeemable) {
+            return false;
+          }
+
+          const settlementPrice = getSettlementPrice(
+            position,
+            marketsByConditionId.get(position.conditionId)
+          );
+
+          return (
+            settlementPrice !== null &&
+            settlementPrice <= RESOLUTION_PRICE_EPSILON
+          );
+        })
+        .map((position) => position.conditionId)
+    ),
+  ];
 }
 
 async function settleRedeemTasks<T>(
@@ -173,7 +333,7 @@ export function registerTradingTools(
     'redeem_positions',
     {
       description:
-        'Redeem (claim) one or more winning positions after market resolution. Uses Polymarket builder relayer for gasless claim when configured, otherwise falls back to an on-chain transaction.',
+        'Redeem one or more resolved positions after market settlement. Supports explicit market IDs or automatic cleanup of redeemable settled losses. Uses Polymarket builder relayer for gasless claim when configured, otherwise falls back to an on-chain transaction.',
       inputSchema: z
         .object({
           condition_id: z
@@ -185,6 +345,12 @@ export function registerTradingTools(
             .array(z.string().min(1))
             .optional()
             .describe('Multiple market condition IDs to redeem in one call'),
+          redeem_settled_losses: z
+            .boolean()
+            .default(false)
+            .describe(
+              'Automatically redeem all resolved losing positions that are still redeemable, so they no longer linger as stale dust'
+            ),
           method: z
             .enum(['auto', 'gasless', 'onchain'])
             .default('auto')
@@ -195,26 +361,63 @@ export function registerTradingTools(
         .refine(
           (value) =>
             Boolean(value.condition_id?.trim()) ||
+            value.redeem_settled_losses ||
             Boolean(
               value.condition_ids?.some((conditionId) => conditionId.trim())
             ),
           {
-            message: 'Provide condition_id or condition_ids',
+            message:
+              'Provide condition_id, condition_ids, or set redeem_settled_losses=true',
             path: ['condition_id'],
           }
         ),
     },
-    async ({ condition_id, condition_ids, method }) => {
+    async ({ condition_id, condition_ids, redeem_settled_losses, method }) => {
       const authErr = requireAuth(client.isReadOnly);
       if (authErr) return formatError(authErr);
       try {
-        const requestedConditionIds = normalizeConditionIds(
+        if (redeem_settled_losses && !client.hasBuilderRelayer) {
+          return formatError(
+            'redeem_settled_losses requires builder relayer credentials because settled-loss cleanup is gasless only'
+          );
+        }
+
+        const explicitConditionIds = normalizeConditionIds(
           condition_id,
           condition_ids
         );
-        const markets = await getMarketsByConditionIds(requestedConditionIds);
-        const marketsByConditionId = new Map(
-          markets.map((market) => [market.conditionId, market])
+        const autoSelectedConditionIds = redeem_settled_losses
+          ? await getRedeemableSettledLossConditionIds(
+              client.proxyAddress ?? ''
+            )
+          : [];
+        const requestedConditionIds = [
+          ...new Set([...explicitConditionIds, ...autoSelectedConditionIds]),
+        ];
+        const effectiveMethod = redeem_settled_losses ? 'gasless' : method;
+        const runSequentially =
+          effectiveMethod === 'onchain' ||
+          (effectiveMethod === 'auto' && !client.hasBuilderRelayer) ||
+          ((effectiveMethod === 'gasless' ||
+            (effectiveMethod === 'auto' && client.hasBuilderRelayer)) &&
+            client.usesSafeSigning);
+
+        if (requestedConditionIds.length === 0) {
+          return formatResult({
+            success: true,
+            requestedCount: 0,
+            redeemedCount: 0,
+            failedCount: 0,
+            autoSelectedConditionIds,
+            effectiveMethod,
+            results: [],
+            failures: [],
+            message: 'No redeemable settled-loss positions found',
+          });
+        }
+
+        const marketsByConditionId = await loadMarketsByConditionIds(
+          requestedConditionIds
         );
 
         if (requestedConditionIds.length === 1) {
@@ -225,11 +428,13 @@ export function registerTradingTools(
             market.conditionId,
             parseTokenIds(market),
             market.negRisk,
-            method
+            effectiveMethod
           );
           return formatResult({
             success: true,
             conditionId: market.conditionId,
+            autoSelected: autoSelectedConditionIds.includes(market.conditionId),
+            effectiveMethod,
             ...result,
           });
         }
@@ -245,21 +450,20 @@ export function registerTradingTools(
               market.conditionId,
               parseTokenIds(market),
               market.negRisk,
-              method
+              effectiveMethod
             );
 
             return {
               success: true,
               conditionId: market.conditionId,
+              autoSelected: autoSelectedConditionIds.includes(
+                market.conditionId
+              ),
               ...result,
             };
           }
         );
-        const settled = await settleRedeemTasks(
-          redeemTasks,
-          method === 'onchain' ||
-            (method === 'auto' && !client.hasBuilderRelayer)
-        );
+        const settled = await settleRedeemTasks(redeemTasks, runSequentially);
 
         const results: Array<Record<string, unknown>> = [];
         const failures: Array<{ conditionId: string; error: string }> = [];
@@ -284,6 +488,9 @@ export function registerTradingTools(
         return formatResult({
           success: failures.length === 0,
           requestedCount: requestedConditionIds.length,
+          autoSelectedConditionIds,
+          effectiveMethod,
+          sequential: runSequentially,
           redeemedCount: results.length,
           failedCount: failures.length,
           results,
