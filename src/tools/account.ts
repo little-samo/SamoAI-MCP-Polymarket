@@ -146,7 +146,9 @@ function buildPositionView(
 
   let status: PositionStatus = 'open';
   if (position.redeemable) {
-    if (settlementPrice !== null) {
+    if (size <= RESOLUTION_PRICE_EPSILON) {
+      status = 'closed';
+    } else if (settlementPrice !== null) {
       status =
         settlementPrice <= RESOLUTION_PRICE_EPSILON
           ? 'settled_loss'

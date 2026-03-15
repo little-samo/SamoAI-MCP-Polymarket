@@ -179,6 +179,11 @@ async function getRedeemableSettledLossConditionIds(
             return false;
           }
 
+          const size = toFiniteNumber(position.size);
+          if (size <= RESOLUTION_PRICE_EPSILON) {
+            return false;
+          }
+
           const settlementPrice = getSettlementPrice(
             position,
             marketsByConditionId.get(position.conditionId)
